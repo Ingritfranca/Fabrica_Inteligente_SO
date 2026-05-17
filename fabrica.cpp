@@ -7,27 +7,28 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-// Fila de espera
+//Adiciona veículo e tarefa na fila
 void FilaEspera::enqueue(int idVeiculo, const std::string& tarefa) {
     fila.push({idVeiculo, tarefa});
 }
-
+//Remove o primeiro veículo da fila 
 std::pair<int, std::string> FilaEspera::dequeue() {
     auto front = fila.front();
     fila.pop();
     return front;
 }
 
+//Verifica se ainda existe veículo esperando
 bool FilaEspera::empty() const {
     return fila.empty();
 }
 
-// Gerenciador de Robos
+//Vai inicializa os robôs disponíveis
 GerenciadorRobos::GerenciadorRobos(int n) {
     for (int i = 1; i <= n; ++i)
         livres.push(i);
 }
-
+ //Reserva um que esteja livre para o atendimento
 int GerenciadorRobos::reservar() {
     if (livres.empty()) return -1;
     int id = livres.front();
@@ -35,38 +36,40 @@ int GerenciadorRobos::reservar() {
     return id;
 }
 
+//Libera o robô para atender outro veículo
 void GerenciadorRobos::liberar(int idRobo) {
     livres.push(idRobo);
 }
 
+//verifica se existe algum robô livre para atender 
 bool GerenciadorRobos::temLivre() const {
     return !livres.empty();
 }
 
-// Processo filho — grava Robo_X.txt
-//
-// Comunicação via pipe: pai escreve mensagens, filho lê e grava no arquivo
-//   VEICULO <id>    = abre uma nova seção no log
-//   TAREFA <desc>   = registra tarefa
-//   FIM_VEICULO     = Salva alterações e aguarda novo veículo
-//   ENCERRAR        = fecha arquivo e termina
-
+// processo filho
 void rodarFilho(int idRobo, int fdLeitura) {
     std::string nomeArq = "Robo_" + std::to_string(idRobo) + ".txt";
     std::ofstream log(nomeArq);
-    log << "Robo_" << idRobo << "\n";
+    
+    bool primeiroVeiculo = true;
 
-    FILE* pipe = fdopen(fdLeitura, "r");
+    FILE* pipe = fdopen(fdLeitura, "r"); //transforma o pipe em file para usr fgets
     if (!pipe) _exit(1);
 
     char buf[1024];
     while (fgets(buf, sizeof(buf), pipe)) {
         std::string linha(buf);
-        if (!linha.empty() && linha.back() == '\n')
-            linha.pop_back();
+        
+        // remove \n e \r para garantir que funcione corretamente
+        if (!linha.empty() && linha.back() == '\n') linha.pop_back();
+        if (!linha.empty() && linha.back() == '\r') linha.pop_back();
 
-        if (linha.rfind("VEICULO ", 0) == 0) {
-            log << "\nVeiculo " << linha.substr(8) << ":\n";
+        if (linha.rfind("VEICULO ", 0) == 0) { //nova tarefa para um veículo
+            if (!primeiroVeiculo) {
+                log << "\n";
+            }
+            log << "Veiculo " << linha.substr(8) << ":\n";
+            primeiroVeiculo = false;
         } else if (linha.rfind("TAREFA ", 0) == 0) {
             log << "- " << linha.substr(7) << "\n";
         } else if (linha == "FIM_VEICULO") {
@@ -81,8 +84,7 @@ void rodarFilho(int idRobo, int fdLeitura) {
     _exit(0);
 }
 
-// Sistema Central
-
+//inicia sistema central, criando os processos filhos
 SistemaCentral::SistemaCentral(int n, int m)
     : n(n), m(m), gerRobos(n), processos(n + 1)
 {
@@ -95,8 +97,10 @@ SistemaCentral::~SistemaCentral() {
     aguardarFilhos();
 }
 
-void SistemaCentral::criarProcessoFilho(int idRobo) {
-    int fds[2];
+
+void SistemaCentral::criarProcessoFilho(int idRobo) { 
+    //Cria um pipe para comunicação com o processo filho
+    int fds[2];  
     if (pipe(fds) == -1)
         throw std::runtime_error("Erro ao criar pipe");
 
@@ -105,62 +109,92 @@ void SistemaCentral::criarProcessoFilho(int idRobo) {
         throw std::runtime_error("Erro ao fazer fork");
 
     if (pid == 0) {
-        // filho fecha escrita, roda
         close(fds[1]);
         rodarFilho(idRobo, fds[0]);
-        // nunca retorna, garante que processo filho termine
     }
 
-    // pai fecha leitura, guarda escrita
-    close(fds[0]);
+    close(fds[0]);// Pai escreve no pipe
     processos[idRobo] = {idRobo, pid, fds[1]};
 }
 
-void SistemaCentral::enviarMensagem(int idRobo, const std::string& msg
-) {
+void SistemaCentral::enviarMensagem(int idRobo, const std::string& msg) {
     std::string linha = msg + "\n";
     write(processos[idRobo].fdEscrita, linha.c_str(), linha.size());
 }
 
 void SistemaCentral::atribuirVeiculo(int idVeiculo, const std::string& tarefa, int idRobo) {
     veiculosAtivos[idVeiculo] = {idRobo, processos[idRobo].fdEscrita};
-    enviarMensagem(idRobo, "VEICULO " + std::to_string(idVeiculo));
-    enviarMensagem(idRobo, "TAREFA "  + tarefa);
+    enviarMensagem(idRobo, "VEICULO " + std::to_string(idVeiculo));// envia a identificação do veículo para o robô
+    enviarMensagem(idRobo, "TAREFA " + tarefa);// envia a tarefa
 }
 
+// Trata uma nova tarefa para um veículo, alocando um robô ou colocando na fila
 void SistemaCentral::handleTarefa(int idVeiculo, const std::string& tarefa) {
     auto it = veiculosAtivos.find(idVeiculo);
     if (it != veiculosAtivos.end()) {
-        // veículo já em atendimento = enviar tarefa direto
         enviarMensagem(it->second.idRobo, "TAREFA " + tarefa);
+        return;
+    }
+//
+    auto itPendentes = tarefasPendentesFila.find(idVeiculo);
+    if (itPendentes != tarefasPendentesFila.end()) {
+        itPendentes->second.push_back(tarefa);
+        return;
+    }
+//
+    int idRobo = gerRobos.reservar();
+    if (idRobo != -1) {
+        atribuirVeiculo(idVeiculo, tarefa, idRobo);
     } else {
-        int idRobo = gerRobos.reservar(); // O(1)
+        tarefasPendentesFila[idVeiculo].push_back(tarefa);
+        filaEspera.enqueue(idVeiculo, tarefa);
+    }
+}
+ //trata o fim de um veículo, liberando o robô ou marcando como finalizado se estiver na fila
+void SistemaCentral::handleFim(int idVeiculo) {
+    auto it = veiculosAtivos.find(idVeiculo);
+    if (it != veiculosAtivos.end()) {
+        int idRobo = it->second.idRobo;
+        enviarMensagem(idRobo, "FIM_VEICULO");
+        veiculosAtivos.erase(it);
+        
+        gerRobos.liberar(idRobo);
+        processarFila();
+    } else {
+        auto itPendentes = tarefasPendentesFila.find(idVeiculo);
+        if (itPendentes != tarefasPendentesFila.end()) {
+            veiculosFinalizadosNaFila.insert(idVeiculo);
+        }
+    }
+}
+ 
+void SistemaCentral::processarFila() {
+    while (!filaEspera.empty() && gerRobos.temLivre()) {//
+        auto [idVeiculo, primeiraTarefa] = filaEspera.dequeue();
+        
+        auto itPendentes = tarefasPendentesFila.find(idVeiculo);
+        if (itPendentes == tarefasPendentesFila.end()) continue;
+
+        int idRobo = gerRobos.reservar();
         if (idRobo != -1) {
-            atribuirVeiculo(idVeiculo, tarefa, idRobo);
-        } else {
-            filaEspera.enqueue(idVeiculo, tarefa); // sem robô = fila
+            veiculosAtivos[idVeiculo] = {idRobo, processos[idRobo].fdEscrita};
+            enviarMensagem(idRobo, "VEICULO " + std::to_string(idVeiculo));
+            
+            for (const auto& t : itPendentes->second) {
+                enviarMensagem(idRobo, "TAREFA " + t);
+            }
+            
+            tarefasPendentesFila.erase(itPendentes);
+            
+            if (veiculosFinalizadosNaFila.count(idVeiculo)) {
+                veiculosFinalizadosNaFila.erase(idVeiculo);
+                handleFim(idVeiculo); 
+            }
         }
     }
 }
 
-void SistemaCentral::handleFim(int idVeiculo) {
-    auto it = veiculosAtivos.find(idVeiculo);
-    if (it == veiculosAtivos.end()) return;
-
-    int idRobo = it->second.idRobo;
-    enviarMensagem(idRobo, "FIM_VEICULO");
-    veiculosAtivos.erase(it);
-    gerRobos.liberar(idRobo); // O(1)
-    processarFila();
-}
-
-void SistemaCentral::processarFila() {
-    while (!filaEspera.empty() && gerRobos.temLivre()) {
-        auto [idVeiculo, tarefa] = filaEspera.dequeue();
-        atribuirVeiculo(idVeiculo, tarefa, gerRobos.reservar());
-    }
-}
-
+// Envia mensagem de encerramento para os filhos e fecha os pipes
 void SistemaCentral::encerrarFilhos() {
     for (int i = 1; i <= n; ++i) {
         if (processos[i].fdEscrita != -1) {
@@ -171,7 +205,7 @@ void SistemaCentral::encerrarFilhos() {
     }
 }
 
-void SistemaCentral::aguardarFilhos() {
+void SistemaCentral::aguardarFilhos() {// Espera os processos filhos terminarem
     for (int i = 1; i <= n; ++i) {
         if (processos[i].pid > 0) {
             waitpid(processos[i].pid, nullptr, 0);
@@ -183,21 +217,29 @@ void SistemaCentral::aguardarFilhos() {
 void SistemaCentral::executar() {
     std::string linha;
     while (std::getline(std::cin, linha)) {
+        // Limpa possível \r vindo de arquivos do Windows
+        if (!linha.empty() && linha.back() == '\r') linha.pop_back();
+
         if (linha == "FIM") break;
         if (linha.empty()) continue;
 
+        // Extrai idVeiculo e tarefa usando stringstream
         std::istringstream ss(linha);
         std::string token;
         ss >> token;
 
         int idVeiculo;
         try { idVeiculo = std::stoi(token); }
-        catch (...) { continue; }
+        catch (...) { continue; }// Ignora linhas mal formatadas
 
         std::string resto;
         std::getline(ss, resto);
         if (!resto.empty() && resto.front() == ' ')
             resto = resto.substr(1);
+
+        // Limpa \r do final do resto da linha, essencial para o comando "fim" ser lido certo
+        if (!resto.empty() && resto.back() == '\r')
+            resto.pop_back();
 
         if (resto == "fim")
             handleFim(idVeiculo);

@@ -3,23 +3,23 @@
 #include <string>
 #include <utility>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/types.h>
 
-//Fila de espera para veículos sem robô livre enqueue/dequeue em O(1)
+// Fila de espera para veículos que aguardam robô
 class FilaEspera {
 public:
     void enqueue(int idVeiculo, const std::string& tarefa);
     std::pair<int, std::string> dequeue();
     bool empty() const;
 private:
-    std::queue<std::pair<int, std::string>> fila;
+    std::queue<std::pair<int, std::string>> fila; 
 };
 
 
-// Pool de robôs reserva e liberação em O(1)
 class GerenciadorRobos {
-public:
+public:// Inicializa os robôs disponíveis 
     explicit GerenciadorRobos(int n);
     int  reservar();  // retorna id do robô ou -1
     void liberar(int idRobo);
@@ -28,28 +28,33 @@ private:
     std::queue<int> livres;
 };
 
-// Dados de um processo filho (robô)
-
+// Estrutura com informações de cada robô
 struct ProcessoRobo {
-    int   idRobo    = 0;
-    pid_t pid       = 0;
-    int   fdEscrita = -1; // lado de escrita do pipe (pai usa)
+    int   idRobo    = 0; // ID do robô (1..n)
+    pid_t pid       = 0; // PID do processo filho
+    int   fdEscrita = -1; // Pipe usasdo pelo paipara enviar mensagens 
 };
 
-// Orquestrador principal
+
 class SistemaCentral {
 public:
     SistemaCentral(int n, int m);
     ~SistemaCentral();
     void executar();
 
-private:
+private: 
     int n, m;
     GerenciadorRobos gerRobos;
     FilaEspera       filaEspera;
 
     struct InfoVeiculo { int idRobo; int fdEscrita; };
     std::unordered_map<int, InfoVeiculo> veiculosAtivos; // consulta O(1)
+    
+    // Guarda se um veículo já está na fila esperando robô para não duplicar alocação
+    std::unordered_map<int, std::vector<std::string>> tarefasPendentesFila;
+    
+    // Guarda os veículos que enviaram 'fim' enquanto estavam na fila
+    std::unordered_set<int> veiculosFinalizadosNaFila; 
 
     std::vector<ProcessoRobo> processos; // índices 1..n
 
